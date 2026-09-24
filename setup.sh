@@ -120,11 +120,33 @@ if [ -z "${CCP_SOURCE_DIR:-}" ]; then
 fi
 
 # ── the policy repo ───────────────────────────────────────────────────────────────────
+RUNTIME_DIR="$HOME/.claude/policy-runtime"
+
+# Which existing checkout to hand over to: the first of the person's clone and the runtime
+# clone (the one install.sh keeps on trunk) that is on `main` and fast-forwards to it.
+# A machine that stopped converging usually has its clone dirty, branched or behind —
+# handing over to it anyway ran stale code, or died on "ccp-setup missing".
+pick_policy_dir() {
+  local d
+  for d in "$POLICY_DIR" "$RUNTIME_DIR"; do
+    [ -d "$d/.git" ] || continue
+    if [ "$(git -C "$d" symbolic-ref --short -q HEAD)" != main ] \
+       || ! git -C "$d" pull --ff-only -q origin main 2>/dev/null; then
+      warn "$d is not on main or will not fast-forward — trying the next checkout" >&2
+      continue
+    fi
+    [ -x "$d/bin/ccp-setup" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
 if [ -n "${CCP_SOURCE_DIR:-}" ]; then
   POLICY_DIR="$CCP_SOURCE_DIR"
-elif [ -d "$POLICY_DIR/.git" ]; then
-  git -C "$POLICY_DIR" pull --ff-only -q 2>/dev/null \
-    || warn "could not fast-forward $POLICY_DIR — continuing with what is there"
+elif picked="$(pick_policy_dir)"; then
+  POLICY_DIR="$picked"
+elif [ -e "$POLICY_DIR" ]; then
+  die "$POLICY_DIR cannot be brought to trunk (dirty, on a branch, or diverged).
+    Move it aside and re-run this command — a fresh clone is made:  mv $POLICY_DIR $POLICY_DIR.old"
 else
   say "Cloning the policy repo to $POLICY_DIR"
   mkdir -p "$(dirname "$POLICY_DIR")"
