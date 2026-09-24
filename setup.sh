@@ -15,6 +15,12 @@
 #   CCP_NONINTERACTIVE=1  never prompt; report what needs a person instead
 set -uo pipefail
 
+# THE WHOLE SCRIPT IS ONE FUNCTION, CALLED ON THE LAST LINE. Under `curl … | bash`, bash
+# reads the script from the pipe AS IT RUNS; the `exec </dev/tty` below then made it read
+# the REST OF THE SCRIPT from the keyboard — the run sat silent forever (korsarz2k23,
+# 2026-09-24). A function body is read in full before anything in it executes.
+main() {
+
 POLICY_DIR="${CCP_POLICY_DIR:-$HOME/Projects/claude-code-policy}"
 ORG_REPO="eMobility-Innovations/claude-code-policy"
 
@@ -156,3 +162,6 @@ fi
 
 [ -x "$POLICY_DIR/bin/ccp-setup" ] || die "$POLICY_DIR/bin/ccp-setup missing — is the checkout current?"
 exec "$POLICY_DIR/bin/ccp-setup"
+}
+
+main "$@"
