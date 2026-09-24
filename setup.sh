@@ -31,8 +31,15 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*"; exit 1; }
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
 
 # `curl | bash` gives the script's stdin to the pipe; reattach the terminal so the
-# logins below can talk to the person.
-if [ ! -t 0 ] && [ -z "${CCP_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then exec </dev/tty; fi
+# logins below can talk to the person. Reattach the terminal's REAL node, never the
+# /dev/tty alias: macOS kqueue refuses the alias, and `claude auth login` (Bun) died on it
+# with `EINVAL: invalid argument, kqueue` (roua-macbook, 2026-09-24). /dev/tty only when
+# no real node can be named.
+real_tty() {
+  local t; t=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+  case "$t" in ''|'?'|'??') echo /dev/tty ;; *) if [ -r "/dev/$t" ]; then echo "/dev/$t"; else echo /dev/tty; fi ;; esac
+}
+if [ ! -t 0 ] && [ -z "${CCP_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then exec <"$(real_tty)"; fi
 
 [ "$(id -u)" -ne 0 ] || die "run this as your normal user, not root — it asks for privilege itself, once"
 
@@ -109,21 +116,25 @@ case "$(uname -s)" in
 esac
 
 # ── GitHub sign-in ────────────────────────────────────────────────────────────────────
-if [ -z "${CCP_SOURCE_DIR:-}" ]; then
-  if ! gh auth status -h github.com >/dev/null 2>&1; then
-    if [ -n "${CCP_GH_TOKEN:-}" ]; then
-      printf '%s' "$CCP_GH_TOKEN" | gh auth login -h github.com --git-protocol https --with-token \
-        || die "the GitHub token was refused"
-    elif [ -n "${CCP_NONINTERACTIVE:-}" ]; then
-      die "not signed in to GitHub and nobody to ask (set CCP_GH_TOKEN)"
-    else
-      say "Sign in to GitHub — a browser opens; paste the one-time code shown here."
-      gh auth login -h github.com --git-protocol https --web --skip-ssh-key \
-        || die "GitHub sign-in did not complete — re-run this command"
-    fi
+# CCP_SOURCE_DIR replaces the CLONE of the policy repo, never the sign-in: the private repos
+# the installer pulls next still need a GitHub credential. Skipping the whole block for a
+# source dir left the release test's CCP_GH_TOKEN unused, so every private-dep row stayed ❌
+# (release-e2e 802ebe16, winccptestserver, 2026-09-25).
+if ! gh auth status -h github.com >/dev/null 2>&1; then
+  if [ -n "${CCP_GH_TOKEN:-}" ]; then
+    printf '%s' "$CCP_GH_TOKEN" | gh auth login -h github.com --git-protocol https --with-token \
+      || die "the GitHub token was refused"
+  elif [ -n "${CCP_SOURCE_DIR:-}" ]; then
+    warn "not signed in to GitHub — the private repos will be reported, not pulled"
+  elif [ -n "${CCP_NONINTERACTIVE:-}" ]; then
+    die "not signed in to GitHub and nobody to ask (set CCP_GH_TOKEN)"
+  else
+    say "Sign in to GitHub — a browser opens; paste the one-time code shown here."
+    gh auth login -h github.com --git-protocol https --web --skip-ssh-key \
+      || die "GitHub sign-in did not complete — re-run this command"
   fi
-  gh auth setup-git -h github.com >/dev/null 2>&1 || true
 fi
+gh auth status -h github.com >/dev/null 2>&1 && { gh auth setup-git -h github.com >/dev/null 2>&1 || true; }
 
 # ── the policy repo ───────────────────────────────────────────────────────────────────
 RUNTIME_DIR="$HOME/.claude/policy-runtime"
