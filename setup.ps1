@@ -82,15 +82,44 @@ function Enable-Wsl {
     return $reboot
 }
 
+# RESUME AFTER THE REBOOT IS A LOGON SCHEDULED TASK, NOT RunOnce. MEASURED on a fresh Win11
+# profile (VM ccp-win11, 2026-09-25): HKCU\...\RunOnce did not exist, so the old
+# Set-ItemProperty threw under ErrorActionPreference=Stop and setup died BEFORE the restart
+# (resume-proof: "NO REBOOT HAPPENED"). The old value also carried every CCP_* variable
+# inline (hundreds of characters; Windows documents a 260-character limit for a RunOnce
+# entry) and would have started unelevated. With this task the same VM rebooted and a
+# second run started by itself (resume-proof: "RESUMED"). A task registered from this
+# elevated session runs at the user's next logon with highest privileges and no prompt; the
+# CCP_* values ride in a file only this user can read, loaded and deleted by the resumed run.
+$ResumeTask = 'ccp-setup-resume'
+$ResumeEnv  = Join-Path $StateDir 'resume.env.json'
+
 function Request-RebootAndResume {
-    $envPass = (Get-ChildItem env: | Where-Object Name -like 'CCP_*' |
-        ForEach-Object { "`$env:$($_.Name)='$($_.Value -replace "'", "''")';" }) -join ' '
-    $resume = "powershell -NoProfile -ExecutionPolicy Bypass -NoExit -Command `"$envPass & '$Self'`""
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ccp-setup' -Value $resume
+    $vars = @{}
+    Get-ChildItem env: | Where-Object Name -like 'CCP_*' | ForEach-Object { $vars[$_.Name] = $_.Value }
+    $vars | ConvertTo-Json | Set-Content -Path $ResumeEnv -Encoding UTF8
+    & icacls.exe $ResumeEnv /inheritance:r /grant:r "$($env:USERNAME):F" | Out-Null
+    $user   = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$Self`""
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName $ResumeTask -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
     Warn 'Windows must restart once to finish enabling WSL. Setup continues by itself after you log back in.'
     if ($Interactive) { Read-Host 'Press Enter to restart now (Ctrl+C to restart later yourself)' | Out-Null }
     Restart-Computer -Force
     exit 0
+}
+
+# The resumed run: take the carried CCP_* values back, then remove every trace of the resume.
+function Resume-FromReboot {
+    if (Test-Path $ResumeEnv) {
+        (Get-Content -Raw $ResumeEnv | ConvertFrom-Json).PSObject.Properties |
+            ForEach-Object { Set-Item -Path "env:$($_.Name)" -Value $_.Value }
+        Remove-Item -Force $ResumeEnv
+        Say 'Resumed after the restart.'
+    }
+    Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 function Get-WslDistros {
@@ -126,7 +155,9 @@ Say "CCP setup on $env:COMPUTERNAME - one command, one administrator prompt"
 
 if (-not (Test-Admin)) { Invoke-Elevated }
 
+Resume-FromReboot
 if (Enable-Wsl) { Request-RebootAndResume }
+# A RunOnce left by an older setup.ps1 would start a second, unelevated copy at next logon.
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'ccp-setup' -ErrorAction SilentlyContinue
 
 # The distro comes from Microsoft's own manifest, downloaded and hash-checked HERE, then
