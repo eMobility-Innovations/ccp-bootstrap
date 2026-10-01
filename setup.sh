@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CCP setup — the ONE command for macOS, Linux and WSL.
+# CCP setup — the ONE command for macOS, Ubuntu Linux and Ubuntu WSL (nothing else is supported).
 #
 #   curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh | bash
 #
@@ -42,6 +42,15 @@ real_tty() {
 if [ ! -t 0 ] && [ -z "${CCP_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then exec <"$(real_tty)"; fi
 
 [ "$(id -u)" -ne 0 ] || die "run this as your normal user, not root — it asks for privilege itself, once"
+
+# ── supported platforms: macOS, Ubuntu Linux, Windows (setup.ps1 → WSL2 Ubuntu) ───────
+# Refused BEFORE sudo or any package install. Same rule and message as
+# claude-code-policy bin/ccp-platform.sh, which install.sh and ccp-setup enforce.
+if [ "$(uname -s)" = Linux ]; then
+  os_id="$( . "${CCP_OS_RELEASE:-/etc/os-release}" 2>/dev/null && printf '%s' "${ID:-}")"
+  os_name="$( . "${CCP_OS_RELEASE:-/etc/os-release}" 2>/dev/null && printf '%s' "${PRETTY_NAME:-}")"
+  [ "$os_id" = ubuntu ] || die "Unsupported platform: ${os_name:-unknown Linux}. Supported: macOS, Ubuntu Linux, or Windows (setup.ps1 installs WSL2 Ubuntu)."
+fi
 
 # ── one elevation, held for the whole run ─────────────────────────────────────────────
 SUDO=""

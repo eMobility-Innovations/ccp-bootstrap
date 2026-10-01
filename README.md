@@ -11,6 +11,6 @@ sign in to GitHub.
 | Machine | Run (as your normal user) |
 |---|---|
 | Windows | `irm https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.ps1 \| iex` |
-| macOS / Linux / WSL | `curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh \| bash` |
+| macOS / Ubuntu Linux / Ubuntu WSL | `curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh \| bash` |
 
 Prerequisite: git (and curl on Linux). Full guide: dojo.fiszu.com/devops/installation/ikb-ccp
