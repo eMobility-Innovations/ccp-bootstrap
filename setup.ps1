@@ -19,6 +19,8 @@ $SetupShUrl = if ($env:CCP_SETUP_SH_URL) { $env:CCP_SETUP_SH_URL } else { $Setup
 $Image      = if ($env:CCP_DISTRO_IMAGE) { $env:CCP_DISTRO_IMAGE } else { 'Ubuntu-26.04' }
 $Distro     = if ($env:CCP_DISTRO) { $env:CCP_DISTRO } else { $Image }
 $StateDir   = Join-Path $env:LOCALAPPDATA 'ccp-setup'
+# Where `wsl --import` puts the distro's disk. The release test points it at a data drive.
+$DistroRoot = if ($env:CCP_DISTRO_ROOT) { $env:CCP_DISTRO_ROOT } else { Join-Path $StateDir 'distros' }
 $Self       = Join-Path $StateDir 'setup.ps1'
 $Log        = Join-Path $StateDir 'setup.log'
 $Interactive = -not $env:CCP_NONINTERACTIVE
@@ -183,7 +185,7 @@ function Install-Distro {
             Remove-Item $file -Force; Die "The $Image image failed its SHA-256 check - refused."
         }
     }
-    $dir = Join-Path $StateDir "distros\$Distro"
+    $dir = Join-Path $DistroRoot $Distro
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Say "Importing $Distro"
     & wsl.exe --import $Distro $dir $file --version 2

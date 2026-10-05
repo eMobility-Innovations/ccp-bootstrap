@@ -11,6 +11,16 @@ sign in to GitHub.
 | Machine | Run (as your normal user) |
 |---|---|
 | Windows | `irm https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.ps1 \| iex` |
-| macOS / Ubuntu Linux / Ubuntu WSL | `curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh \| bash` |
+| macOS / Linux / WSL | `curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh \| bash` |
 
 Prerequisite: git (and curl on Linux). Full guide: dojo.fiszu.com/devops/installation/ikb-ccp
+
+## `grafana-api` — Grafana from Claude Code, without CCP
+
+`grafana-api` calls grafana.fiszu.com **as you**, after one browser sign-in with your company
+account. CCP installs it automatically; on a machine without CCP:
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/grafana-api -o ~/.local/bin/grafana-api && chmod +x ~/.local/bin/grafana-api
+grafana-api login
+```

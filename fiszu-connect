@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Connect Claude Code to the company's data connectors AS YOURSELF.
+
+The MCP server `fiszu` (https://claude.fiszu.com/connectors/mcp) reads company systems with
+YOUR Keycloak identity: it shows only the tools your groups grant, and refuses you on the next
+call once your account is disabled. This helper holds your sign-in and hands Claude Code a
+fresh bearer on demand — it holds no company secret (`ai-connectors-cli` is a public client).
+
+Plan: internal-knowledge-base/plans/2026-10-04_ai-connector-platform.md §2.2, §6.3.
+"""
+import argparse
+import fcntl
+import getpass
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+# >>> kc_device_login — INLINED by bin/bundle-stdlib-cli.py from claude-code-policy; do not edit here.
+import types as _types  # noqa: E402
+kcd = _types.ModuleType("kc_device_login")
+exec(compile('"""Keycloak device login + silent refresh for the org\'s public CLI clients — ONE copy.\n\n`grafana-api` (client `grafana-cli`) and `fiszu-connect` (client `ai-connectors-cli`) both\nsign a PERSON in with the device authorization grant (RFC 8628) and then keep a refresh\ntoken so later calls stay silent until the account is disabled or the offline session lapses.\nPlan: internal-knowledge-base/plans/2026-10-04_ai-connector-platform.md §2.2 — "lifted out of\nbin/grafana-api into ONE shared module both import — not a second copy".\n\nStdlib only and holds no secret (both clients are public), so the CLIs stay publishable.\nThe standalone copies in ccp-bootstrap are BUILT by bin/bundle-stdlib-cli.py, which inlines\nthis file between the `>>> kc_device_login` markers; never paste it by hand.\n\nEvery network call goes through a `kc(endpoint, fields)` callable the caller supplies, so a\nCLI keeps its own User-Agent, realm/client overrides and test seams.\n"""\nimport json\nimport os\nimport tempfile\nimport time\nimport urllib.error\nimport urllib.parse\nimport urllib.request\n\n\nclass LoginRequired(Exception):\n    pass\n\n\n# Only known protocol error classes may reach diagnostics: an error_description can quote\n# anything, including the credential that was refused.\nKNOWN_ERRORS = frozenset({\n    \'invalid_grant\', \'invalid_client\', \'unauthorized_client\', \'access_denied\',\n    \'expired_token\', \'authorization_pending\', \'slow_down\', \'invalid_request\',\n    \'invalid_scope\', \'unsupported_grant_type\', \'server_error\', \'temporarily_unavailable\'})\n\nDEVICE_GRANT = \'urn:ietf:params:oauth:grant-type:device_code\'\n\n\ndef http(method, url, headers, body, user_agent, timeout=30):\n    """(status, body bytes). An HTTP error is a status, never an exception."""\n    # Cloudflare in front of *.fiszu.com 403s Python\'s default `Python-urllib` agent.\n    headers = dict(headers, **{\'User-Agent\': user_agent})\n    request = urllib.request.Request(url, data=body, headers=headers, method=method)\n    try:\n        with urllib.request.urlopen(request, timeout=timeout) as response:\n            return response.status, response.read()\n    except urllib.error.HTTPError as exc:\n        return exc.code, exc.read()\n\n\ndef kc_post(send, realm_url, client_id, endpoint, fields):\n    """POST a form to `<realm>/protocol/openid-connect/<endpoint>` → (status, JSON dict)."""\n    fields = dict(fields, client_id=client_id)\n    status, body = send(\'POST\', realm_url.rstrip(\'/\') + \'/protocol/openid-connect/\' + endpoint,\n                        {\'Content-Type\': \'application/x-www-form-urlencoded\'},\n                        urllib.parse.urlencode(fields).encode())\n    if not body:\n        return status, {}\n    try:\n        return status, json.loads(body)\n    except ValueError:\n        # Never echo the body: on the token endpoint it can carry a credential.\n        raise ValueError(\'Keycloak \' + endpoint + \' returned a non-JSON reply (HTTP \' + str(status) + \')\') from None\n\n\ndef error_class(data, status):\n    error = data.get(\'error\') if isinstance(data, dict) else None\n    return error if isinstance(error, str) and error in KNOWN_ERRORS else \'HTTP \' + str(status)\n\n\ndef save_private(path, data):\n    """Atomically write JSON at 0600 inside a 0700 directory."""\n    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n    path.parent.chmod(0o700)\n    fd, name = tempfile.mkstemp(prefix=\'.credentials-\', dir=path.parent)\n    try:\n        with os.fdopen(fd, \'w\', encoding=\'utf-8\') as stream:\n            os.fchmod(stream.fileno(), 0o600)\n            json.dump(data, stream)\n            stream.flush()\n            os.fsync(stream.fileno())\n        os.replace(name, path)\n    finally:\n        if os.path.exists(name):\n            os.unlink(name)\n\n\ndef read_credentials(path, login_hint):\n    try:\n        return json.loads(path.read_text(encoding=\'utf-8\'))\n    except FileNotFoundError:\n        raise LoginRequired(\'not logged in — run: \' + login_hint)\n\n\ndef credentials_from(token, previous=None):\n    """The stored shape: access token, its absolute expiry, and the refresh token to keep."""\n    data = {\'access_token\': token[\'access_token\'],\n            \'refresh_token\': token.get(\'refresh_token\') or (previous or {}).get(\'refresh_token\'),\n            \'exp\': time.time() + float(token[\'expires_in\'])}\n    if not data[\'refresh_token\']:\n        raise ValueError(\'missing refresh token\')\n    return data\n\n\ndef valid_access(data, skew=30):\n    """The stored access token if it outlives `skew` seconds, else None."""\n    if data.get(\'access_token\') and float(data.get(\'exp\', 0)) > time.time() + skew:\n        return data[\'access_token\']\n    return None\n\n\ndef refresh(kc, data, login_hint):\n    """Exchange the refresh token → new credentials. A refusal ENDS the login (LoginRequired)."""\n    status, token = kc(\'token\', {\'grant_type\': \'refresh_token\', \'refresh_token\': data[\'refresh_token\']})\n    if status == 200:\n        return token\n    # ONLY A REFUSAL ENDS A LOGIN. Keycloak answers a dead refresh token (account disabled,\n    # session revoked, offline session idle-expired) with 400/401 `invalid_grant`. A 5xx or a\n    # proxy error is Keycloak being away: the credentials are still good, and treating it as\n    # a refusal would sign every machine out during an IdP blip.\n    if status in (400, 401):\n        raise LoginRequired(\'Keycloak refused the refresh (\' + error_class(token, status) +\n                            \') — your access ended or expired; run: \' + login_hint)\n    raise ValueError(\'Keycloak unavailable (\' + error_class(token, status) + \'), credentials kept\')\n\n\ndef device_flow(kc, announce, scope=\'openid email profile offline_access\'):\n    """Run the device grant to completion and return Keycloak\'s token response.\n\n    `announce(uri, user_code)` tells the person where to approve; it never runs a browser by\n    itself, so an unattended caller can decide not to start a login at all.\n    """\n    status, grant = kc(\'auth/device\', {\'scope\': scope})\n    if status != 200:\n        raise ValueError(\'device authorization refused\')\n    announce(grant.get(\'verification_uri_complete\') or grant[\'verification_uri\'], grant[\'user_code\'])\n    interval = int(grant.get(\'interval\', 5))\n    deadline = time.monotonic() + int(grant[\'expires_in\'])\n    while time.monotonic() < deadline:\n        time.sleep(interval)\n        if time.monotonic() >= deadline:\n            break\n        status, token = kc(\'token\', {\'grant_type\': DEVICE_GRANT, \'device_code\': grant[\'device_code\']})\n        if status == 200:\n            return token\n        error = error_class(token, status)\n        if error == \'slow_down\':\n            interval += 5\n        elif error == \'expired_token\':\n            break\n        elif error != \'authorization_pending\':\n            raise ValueError(\'device login refused\')\n    raise ValueError(\'device login expired\')\n\n\ndef revoke(kc, refresh_token):\n    """(ok, reason). Revoking is best effort; the caller deletes local credentials regardless."""\n    try:\n        status, _ = kc(\'revoke\', {\'token\': refresh_token})\n    except (OSError, ValueError) as exc:\n        return False, type(exc).__name__\n    return 200 <= status < 300, \'HTTP \' + str(status)\n', "kc_device_login.py", "exec"), kcd.__dict__)
+sys.modules["kc_device_login"] = kcd
+# <<< kc_device_login
+
+LoginRequired = kcd.LoginRequired
+USER_AGENT = 'fiszu-connect/1 (+claude-code-policy)'
+LOGIN_HINT = 'fiszu-connect login'
+SERVER_NAME = 'fiszu'
+# Claude Code gives a headersHelper 10 s (code.claude.com/docs/en/mcp, "dynamic headers");
+# one Keycloak round trip must fit inside that with room to print.
+HEADERS_HTTP_TIMEOUT = 7
+EXIT_LOGIN = 3
+
+
+def _gateway():
+    return os.environ.get('FISZU_CONNECT_URL', 'https://claude.fiszu.com/connectors/mcp')
+
+
+def _http(method, url, headers, body):
+    return kcd.http(method, url, headers, body, USER_AGENT, timeout=HEADERS_HTTP_TIMEOUT)
+
+
+def _dir():
+    return Path(os.environ.get('FISZU_CONNECT_CONFIG_DIR', str(Path.home() / '.config/fiszu-connect')))
+
+
+def _path():
+    return _dir() / 'credentials.json'
+
+
+def _kc(endpoint, fields):
+    realm = os.environ.get('FISZU_CONNECT_KC_REALM_URL', 'https://auth.fiszu.com/realms/fiszu')
+    client = os.environ.get('FISZU_CONNECT_CLIENT_ID', 'ai-connectors-cli')
+    return kcd.kc_post(lambda *a: _http(*a), realm, client, endpoint, fields)
+
+
+@contextmanager
+def _locked():
+    """One refresher at a time. Every Claude Code session runs `headers` on connect, and two
+    concurrent refreshes of one rotating refresh token would leave one of them refused."""
+    _dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(_dir() / '.lock', 'a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _store(token, previous=None):
+    data = kcd.credentials_from(token, previous)
+    kcd.save_private(_path(), data)
+    return data['access_token']
+
+
+def _token():
+    data = kcd.read_credentials(_path(), LOGIN_HINT)
+    access = kcd.valid_access(data)
+    if access:
+        return access
+    with _locked():
+        # Re-read under the lock: another session may have refreshed while we waited.
+        data = kcd.read_credentials(_path(), LOGIN_HINT)
+        access = kcd.valid_access(data)
+        if access:
+            return access
+        try:
+            token = kcd.refresh(_kc, data, LOGIN_HINT)
+        except LoginRequired:
+            _path().unlink(missing_ok=True)
+            raise
+        return _store(token, data)
+
+
+def _claims(token):
+    """The token's payload, for DISPLAY only — the gateway verifies the signature, not us."""
+    import base64
+    try:
+        part = token.split('.')[1]
+        return json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+    except (IndexError, ValueError):
+        return {}
+
+
+def _machine():
+    """Attribution ("whence"), never authorization — the principal is the person."""
+    return getpass.getuser() + '@' + socket.gethostname().split('.')[0]
+
+
+def cmd_headers(_args):
+    try:
+        token = _token()
+    except LoginRequired as exc:
+        # Claude Code needs JSON on stdout even on failure; `/mcp` shows the server failing
+        # and the hint below says why.
+        print('{}')
+        print('fiszu-connect: ' + str(exc), file=sys.stderr)
+        return EXIT_LOGIN
+    print(json.dumps({'Authorization': 'Bearer ' + token, 'X-Fiszu-Machine': _machine()}))
+    return 0
+
+
+def _person_present():
+    """A human at a terminal: stdin is a tty AND /dev/tty opens (same test as the claude-mem
+    sign-in). A device login nobody can approve waits ten minutes and then fails — so an
+    installer's captured run, a hook or a CI job never starts one."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        open('/dev/tty', 'w').close()
+    except OSError:
+        return False
+    return True
+
+
+def cmd_login(args):
+    if not getattr(args, 'force', False) and not _person_present():
+        raise LoginRequired('no person at a terminal to approve the sign-in — run `' + LOGIN_HINT +
+                            '` yourself (or `fiszu-connect login --force` to print the code anyway)')
+
+    def announce(uri, code):
+        print('fiszu-connect: approve this sign-in in your browser: ' + uri + ' (code ' + code + ')',
+              file=sys.stderr, flush=True)
+    access = _store(kcd.device_flow(_kc, announce))
+    print('fiszu-connect: signed in as ' + str(_claims(access).get('preferred_username', '?')))
+    return 0
+
+
+def cmd_status(_args):
+    try:
+        token = _token()
+    except LoginRequired as exc:
+        print('fiszu-connect: ' + str(exc))
+        return EXIT_LOGIN
+    claims = _claims(token)
+    left = int(float(kcd.read_credentials(_path(), LOGIN_HINT).get('exp', 0)) - time.time())
+    print('fiszu-connect: signed in as ' + str(claims.get('preferred_username', '?')) +
+          ' (' + str(claims.get('email', '')) + '); access token valid ' + str(max(left, 0)) +
+          ' s, renewed silently; gateway ' + _gateway())
+    return 0
+
+
+def cmd_logout(_args):
+    if not _path().exists():
+        print('fiszu-connect: not signed in')
+        return 0
+    try:
+        ok, reason = kcd.revoke(_kc, kcd.read_credentials(_path(), LOGIN_HINT)['refresh_token'])
+        if not ok:
+            print('fiszu-connect: revoke failed (' + reason + '); local sign-in removed anyway', file=sys.stderr)
+    except (OSError, ValueError, KeyError) as exc:
+        print('fiszu-connect: revoke failed (' + type(exc).__name__ + '); local sign-in removed anyway',
+              file=sys.stderr)
+    finally:
+        _path().unlink(missing_ok=True)
+    print('fiszu-connect: signed out')
+    return 0
+
+
+def mcp_definition(helper):
+    return {'type': 'http', 'url': _gateway(),
+            'headersHelper': shlex.quote(str(helper)) + ' headers'}
+
+
+def cmd_install(_args):
+    """Standalone path (no CCP): register `fiszu` for this user, then sign in if needed."""
+    claude = shutil.which('claude')
+    if not claude:
+        print('fiszu-connect: `claude` is not on PATH — install Claude Code first', file=sys.stderr)
+        return 1
+    helper = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(__file__).resolve()
+    subprocess.run([claude, 'mcp', 'remove', '--scope', 'user', SERVER_NAME],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    done = subprocess.run([claude, 'mcp', 'add-json', '--scope', 'user', SERVER_NAME,
+                           json.dumps(mcp_definition(helper))], check=False)
+    if done.returncode != 0:
+        print('fiszu-connect: `claude mcp add-json` failed (exit ' + str(done.returncode) + ')', file=sys.stderr)
+        return 1
+    print('fiszu-connect: MCP server `' + SERVER_NAME + '` registered for this user')
+    try:
+        _token()
+        return cmd_status(_args)
+    except LoginRequired:
+        return cmd_login(_args)
+
+
+COMMANDS = {'headers': cmd_headers, 'login': cmd_login, 'status': cmd_status,
+            'logout': cmd_logout, 'install': cmd_install}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='login — sign in with your company account (browser approval)\n'
+               'status — who you are signed in as\n'
+               'headers — print the MCP auth headers (Claude Code runs this for you)\n'
+               'logout — revoke and remove your sign-in\n'
+               'install — without CCP: register the `fiszu` MCP server and sign in\n'
+               'exit 3 = not signed in (run: fiszu-connect login)')
+    parser.add_argument('command', choices=sorted(COMMANDS))
+    parser.add_argument('--force', action='store_true',
+                        help='login: start the device sign-in even without a terminal (prints the code)')
+    args = parser.parse_args(argv)
+    try:
+        return COMMANDS[args.command](args)
+    except LoginRequired as exc:
+        print('fiszu-connect: ' + str(exc), file=sys.stderr)
+        return EXIT_LOGIN
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # A plain ValueError carries only this tool's own fixed messages; anything else may
+        # quote a response, so it shows its class only.
+        reason = str(exc) if type(exc) is ValueError else type(exc).__name__
+        if args.command == 'headers':
+            print('{}')
+        print('fiszu-connect: ' + args.command + ' failed (' + reason + ')', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
