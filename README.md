@@ -35,3 +35,11 @@ account. CCP installs it automatically; on a machine without CCP:
 mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/grafana-api -o ~/.local/bin/grafana-api && chmod +x ~/.local/bin/grafana-api
 grafana-api login
 ```
+
+## fiszu-connect — company data connectors in Claude Code, without CCP
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/install-fiszu-connect.sh | bash
+```
+
+This installs `fiszu-connect`, adds it to your terminal's PATH, offers to install Claude Code if needed, and connects company data after one browser sign-in with your company account.
