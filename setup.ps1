@@ -25,9 +25,19 @@ $Self       = Join-Path $StateDir 'setup.ps1'
 $Log        = Join-Path $StateDir 'setup.log'
 $Interactive = -not $env:CCP_NONINTERACTIVE
 
+$DojoWsl = 'https://dojo.fiszu.com/systems/claude-code-setup/windows-wsl/'
+function Show-WslNote {
+    Write-Host ''
+    Write-Host '  CCP on Windows runs inside WSL (Ubuntu). We recommend WSL strongly - native Windows is not supported.' -ForegroundColor Cyan
+    Write-Host '  This script installs WSL and Ubuntu for you, then finishes the setup inside it.' -ForegroundColor Cyan
+    Write-Host "  Step-by-step Windows + WSL guide: $DojoWsl" -ForegroundColor Cyan
+    Write-Host ''
+}
+Show-WslNote
+
 function Say($m)  { Write-Host "==> $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function Die($m)  { Write-Host "[x] $m" -ForegroundColor Red; Write-Host "    Log: $Log"; exit 1 }
+function Die($m)  { Write-Host "[x] $m" -ForegroundColor Red; Write-Host "    Log: $Log"; Write-Host "    Windows + WSL guide: $DojoWsl"; exit 1 }
 
 function Test-Admin {
     $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -249,6 +259,6 @@ $rc = $LASTEXITCODE
 
 $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
 if ($rc -eq 0) { Say "Done in $mins min. Open 'Ubuntu' (or run: wsl) and start claude." }
-else { Warn "Setup finished with outstanding items after $mins min - re-run the same command to retry. Log: $Log" }
+else { Warn "Setup finished with outstanding items after $mins min - re-run the same command to retry. Log: $Log. Guide: $DojoWsl" }
 Stop-Transcript | Out-Null
 exit $rc

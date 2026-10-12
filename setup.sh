@@ -41,6 +41,16 @@ real_tty() {
 }
 if [ ! -t 0 ] && [ -z "${CCP_NONINTERACTIVE:-}" ] && [ -r /dev/tty ]; then exec <"$(real_tty)"; fi
 
+cat <<'BANNER'
+
+  CCP setup — one command, nothing else to run.
+  It installs what is missing (git, curl, python3, Node, Claude Code ...), then walks you
+  through each sign-in in turn: GitHub, Claude, Tailscale, Pangolin, Codex, claude-mem and
+  the fiszu connectors. Browser steps are waited for and checked. Re-run it any time to repair.
+  Step-by-step guide with screenshots: https://dojo.fiszu.com/systems/claude-code-setup/
+
+BANNER
+
 [ "$(id -u)" -ne 0 ] || die "run this as your normal user, not root — it asks for privilege itself, once"
 
 # ── one elevation, held for the whole run ─────────────────────────────────────────────
@@ -74,6 +84,11 @@ install_base_linux() {
   command -v git  >/dev/null || need+=(git)
   command -v curl >/dev/null || need+=(curl)
   command -v python3 >/dev/null || need+=(python3)
+  # xz: the Node.js tarball is .tar.xz — without it node, npm and codex all fail to install
+  # (clean ubuntu:26.04, 2026-10-13). unzip: some vendor installers unpack with it.
+  command -v xz >/dev/null || need+=(xz-utils)
+  command -v unzip >/dev/null || need+=(unzip)
+  [ -e /etc/ssl/certs/ca-certificates.crt ] || need+=(ca-certificates)
   if ! command -v gh >/dev/null; then
     if command -v apt-get >/dev/null; then
       # GitHub's own apt repo: distro gh packages lag badly on LTS.
@@ -90,13 +105,17 @@ install_base_linux() {
   if command -v apt-get >/dev/null; then
     $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq \
       && $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" >/dev/null
-  elif command -v dnf >/dev/null; then $SUDO dnf install -y -q "${need[@]}"
-  elif command -v pacman >/dev/null; then $SUDO pacman -S --noconfirm --needed "${need[@]/gh/github-cli}"
+  elif command -v dnf >/dev/null; then $SUDO dnf install -y -q "${need[@]/xz-utils/xz}"
+  elif command -v pacman >/dev/null; then
+    $SUDO pacman -S --noconfirm --needed $(printf '%s\n' "${need[@]/xz-utils/xz}" | sed 's/^gh$/github-cli/')
   else die "no supported package manager — install ${need[*]} and re-run"
   fi
 }
 
 install_base_darwin() {
+  if ! xcode-select -p >/dev/null 2>&1; then
+    say "macOS will now offer to install the Command Line Tools (git lives there). Click Install and wait — this script carries on by itself afterwards."
+  fi
   if ! command -v brew >/dev/null; then
     say "Installing Homebrew (it will ask for your password once)"
     NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
@@ -139,17 +158,32 @@ gh auth status -h github.com >/dev/null 2>&1 && { gh auth setup-git -h github.co
 # ── the policy repo ───────────────────────────────────────────────────────────────────
 RUNTIME_DIR="$HOME/.claude/policy-runtime"
 
+# THE FLEET INSTALLS FROM `release`, NOT `main` (operator 2026-10-05): `release` only ever holds
+# an installer the WSL release test CONVERGED on. `main` only while origin has none
+# (`ls-remote --exit-code` answers 2 for exactly that).
+#   fleet_branch <remote-or-url> — run inside any directory
+fleet_branch() {
+  local probe=0
+  git ls-remote --exit-code --heads "$1" release >/dev/null 2>&1 || probe=$?
+  if [ "$probe" -eq 2 ]; then printf 'main\n'; else printf 'release\n'; fi
+}
+
 # Which existing checkout to hand over to: the first of the person's clone and the runtime
-# clone (the one install.sh keeps on trunk) that is on `main` and fast-forwards to it.
+# clone (the one install.sh keeps on the fleet branch) that is on `main` or `release` and
+# fast-forwards. The runtime clone is fast-forwarded to the FLEET branch whatever its local
+# name; the person's clone to its own (a developer's stays on main).
 # A machine that stopped converging usually has its clone dirty, branched or behind —
 # handing over to it anyway ran stale code, or died on "ccp-setup missing".
 pick_policy_dir() {
-  local d
+  local d head want
   for d in "$POLICY_DIR" "$RUNTIME_DIR"; do
     [ -d "$d/.git" ] || continue
-    if [ "$(git -C "$d" symbolic-ref --short -q HEAD)" != main ] \
-       || ! git -C "$d" pull --ff-only -q origin main 2>/dev/null; then
-      warn "$d is not on main or will not fast-forward — trying the next checkout" >&2
+    head="$(git -C "$d" symbolic-ref --short -q HEAD)"
+    want="$head"
+    [ "$d" = "$RUNTIME_DIR" ] && want="$(cd "$d" && fleet_branch origin)"
+    if { [ "$head" != main ] && [ "$head" != release ]; } \
+       || ! git -C "$d" pull --ff-only -q origin "$want" 2>/dev/null; then
+      warn "$d is not on main/release or will not fast-forward — trying the next checkout" >&2
       continue
     fi
     [ -x "$d/bin/ccp-setup" ] && { printf '%s\n' "$d"; return 0; }
@@ -167,7 +201,7 @@ elif [ -e "$POLICY_DIR" ]; then
 else
   say "Cloning the policy repo to $POLICY_DIR"
   mkdir -p "$(dirname "$POLICY_DIR")"
-  gh repo clone "$ORG_REPO" "$POLICY_DIR" -- -q 2>/dev/null \
+  gh repo clone "$ORG_REPO" "$POLICY_DIR" -- -q --branch "$(fleet_branch "https://github.com/$ORG_REPO.git")" \
     || die "could not clone $ORG_REPO — your GitHub account needs access to eMobility-Innovations (ask Patryk Radek)"
 fi
 

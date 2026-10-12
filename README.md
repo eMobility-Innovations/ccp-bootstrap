@@ -13,7 +13,18 @@ sign in to GitHub.
 | Windows | `irm https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.ps1 \| iex` |
 | macOS / Linux / WSL | `curl -fsSL https://raw.githubusercontent.com/eMobility-Innovations/ccp-bootstrap/main/setup.sh \| bash` |
 
-Prerequisite: git (and curl on Linux). Full guide: dojo.fiszu.com/devops/installation/ikb-ccp
+**One command does everything.** It installs what is missing (git, curl, python3, unzip, xz,
+GitHub CLI, Node, Claude Code itself via Anthropic's native installer
+`curl -fsSL https://claude.ai/install.sh | bash`), then walks you through every sign-in in the
+foreground and waits for each browser approval: GitHub, Claude (accounts are listed at
+https://claude.fiszu.com), Tailscale, Pangolin, Codex, claude-mem and the fiszu connectors.
+You need nothing installed beforehand except `curl` (Linux) — and a normal user with sudo.
+
+**Windows: use WSL Ubuntu.** `setup.ps1` installs WSL + Ubuntu for you and finishes the setup
+inside it. Guide: https://dojo.fiszu.com/systems/claude-code-setup/windows-wsl/
+
+Full guide: https://dojo.fiszu.com/systems/claude-code-setup/ (CCP guide:
+https://dojo.fiszu.com/devops/installation/ikb-ccp)
 
 ## `grafana-api` — Grafana from Claude Code, without CCP
 
