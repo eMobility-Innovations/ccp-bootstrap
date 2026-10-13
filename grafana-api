@@ -35,7 +35,7 @@ def _token():
     return os.environ.get('GRAFANA_SERVICE_ACCOUNT_TOKEN') or company_token.token('grafana')
 
 
-def _api(method, path, body=None, query=()):
+def _api(method, path, body=None, query=(), org=None):
     if not path.startswith('/') or path.startswith('//'):
         raise ValueError('path must be relative to Grafana')
     url = os.environ.get('GRAFANA_URL', 'https://grafana.fiszu.com').rstrip('/') + path
@@ -44,6 +44,8 @@ def _api(method, path, body=None, query=()):
     token = _token()
     headers = {'Authorization': 'Bearer ' + token} if os.environ.get('GRAFANA_SERVICE_ACCOUNT_TOKEN') else {'X-JWT-Assertion': token}
     headers.update({'Accept': 'application/json'})
+    if org is not None:
+        headers['X-Grafana-Org-Id'] = str(org)
     if body is not None:
         headers['Content-Type'] = 'application/json'
     return _http(method, url, headers, body)
@@ -83,6 +85,56 @@ def _identity(login=False):
     return 0
 
 
+def _user_orgs():
+    status, body = _api('GET', '/api/user/orgs')
+    if not 200 <= status < 300:
+        raise ValueError('could not list your Grafana organisations (HTTP ' + str(status) + ')')
+    return json.loads(body)
+
+
+def _orgs():
+    for org in _user_orgs():
+        print(str(org['orgId']) + '\t' + str(org['name']) + '\t' + str(org['role']))
+    return 0
+
+
+def _resolve_org(value):
+    if value is None or value.isdigit():
+        return value
+    orgs = _user_orgs()
+    for org in orgs:
+        if org['name'].lower() == value.lower():
+            return str(org['orgId'])
+    names = ', '.join(str(o['orgId']) + ' ' + o['name'] for o in orgs)
+    raise ValueError('no Grafana organisation called "' + value + '" — yours are: ' + names)
+
+
+def _all_orgs(args):
+    path = args.command if args.command.startswith('/') else args.path
+    if (not args.command.startswith('/') and args.command != 'GET') or path not in ('/api/search', '/api/datasources'):
+        raise ValueError('--all-orgs only works with /api/search and /api/datasources')
+    query = _query(args)
+    rows = []
+    for org in _user_orgs():
+        status, body = _api('GET', path, None, query, org['orgId'])
+        if not 200 <= status < 300:
+            print('grafana-api: could not read organisation "' + str(org['name']) + '" (HTTP ' + str(status) + ')', file=sys.stderr)
+            continue
+        rows += [dict(row, orgId=org['orgId'], orgName=org['name']) for row in json.loads(body)]
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _query(args):
+    query = []
+    for value in args.query:
+        key, separator, item = value.partition('=')
+        if not separator:
+            raise ValueError('query requires k=v')
+        query.append((key, item))
+    return query
+
+
 def _request(args):
     method, path = ('GET', args.command) if args.command.startswith('/') else (args.command, args.path)
     if method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE') or not path:
@@ -91,21 +143,17 @@ def _request(args):
     if body is not None:
         body = Path(body[1:]).read_text(encoding='utf-8') if body.startswith('@') else body
         body = json.dumps(json.loads(body)).encode()
-    query = []
-    for value in args.query:
-        key, separator, item = value.partition('=')
-        if not separator:
-            raise ValueError('query requires k=v')
-        query.append((key, item))
-    return _print_response(*_api(method, path, body, query))
+    return _print_response(*_api(method, path, body, _query(args), _resolve_org(args.org)))
 
 
 def _parse(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='login — use fiszu-connect login\nlogout — use fiszu-connect logout\nwhoami — show user and teams\ntoken — print a valid access token\nGET|POST|PUT|PATCH|DELETE <path> — call the API\n/<path> — call the API with GET')
+        epilog='login — use fiszu-connect login\nlogout — use fiszu-connect logout\nwhoami — show user and teams\norgs — list your Grafana organisations and your role in each\ntoken — print a valid access token\nGET|POST|PUT|PATCH|DELETE <path> — call the API\n/<path> — call the API with GET\n\nA person in several organisations only sees their default one unless they choose:\n  --org <id|name>  run the call inside that organisation\n  --all-orgs       with /api/search or /api/datasources, list every organisation, each result labelled with orgId and orgName')
     parser.add_argument('command')
     parser.add_argument('path', nargs='?')
     parser.add_argument('--data')
+    parser.add_argument('--org')
+    parser.add_argument('--all-orgs', action='store_true')
     parser.add_argument('--query', nargs='+', action='extend', default=[])
     args = parser.parse_args(argv)
     return args
@@ -119,6 +167,12 @@ def _dispatch(args):
         return 0
     if args.command == 'whoami':
         return _identity()
+    if args.command == 'orgs':
+        return _orgs()
+    if args.all_orgs and args.org is not None:
+        raise ValueError('use either --org or --all-orgs, not both')
+    if args.all_orgs:
+        return _all_orgs(args)
     if args.command == 'token':
         print(_token())
         return 0
