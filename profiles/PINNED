@@ -1,0 +1,17 @@
+{
+  "ccp_commit": "008f13833a1394ee09d0146bd63c38c82a1555eb",
+  "profile_version": 1,
+  "source": "contract-v1 (CCP profile not yet published)",
+  "sha256": "f02685e34f981b181edfc94d32f1efcfd1da9b587ad696836cdb1984d4bc6c39",
+  "codex_requirements": {
+    "allow_remote_control": false,
+    "allowed_approval_policies": [
+      "never"
+    ],
+    "feature_requirements": {
+      "remote_control": false,
+      "remote_models": false
+    }
+  },
+  "codex_source_sha256": "402b9a34170d7ba3aceca75d4b8896a4d8950ccf0dad51b4905183dc93635b58"
+}
