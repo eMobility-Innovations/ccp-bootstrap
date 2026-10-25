@@ -50,6 +50,18 @@ chmod 755 "$tmp_file" || fail 1 'the download could not be made executable.' "Ch
 mv -f "$tmp_file" "$bin_dir/fiszu-connect" || fail 1 'fiszu-connect could not be saved.' "Check that you can write to $bin_dir, then run: $installer_command"
 tmp_file=''
 
+profile_dir="$HOME/.local/share/fiszu-connect/profiles"
+mkdir -p "$profile_dir"
+for profile_file in connector-managed-settings.json PINNED; do
+    tmp_file=$(mktemp "$profile_dir/.download.XXXXXX")
+    curl -fsSL "${base_url%/}/profiles/$profile_file" -o "$tmp_file" ||
+        fail 1 'connector control profile could not be downloaded.' "Run: $installer_command"
+    mv -f "$tmp_file" "$profile_dir/$profile_file"
+    tmp_file=''
+done
+"$bin_dir/fiszu-connect" apply-controls ||
+    fail 1 'required connector controls could not be applied.' 'Provision the machine ingest-key file, then rerun the installer in a terminal for sudo approval.'
+
 printf '%s\n' '==> Step 3/5: making fiszu-connect available in your terminal ...'
 case ":${PATH:-}:" in
     *":$bin_dir:"*) printf '%s\n' 'Your bin folder is already on PATH.' ;;

@@ -180,8 +180,280 @@ def mcp_definition(helper):
             'headersHelper': shlex.quote(str(helper)) + ' headers'}
 
 
+# Connector controls are intentionally independent of the full workstation installer.
+def _profiles():
+    local = Path(__file__).resolve().parent / 'profiles'
+    if local.is_dir():
+        return local
+    return Path.home() / '.local/share/fiszu-connect/profiles'
+
+
+def _profile():
+    import hashlib
+    raw = (_profiles() / 'connector-managed-settings.json').read_bytes()
+    pin = json.loads((_profiles() / 'PINNED').read_text())
+    profile = json.loads(raw)
+    if (profile['profile_version'] != pin['profile_version'] or
+            hashlib.sha256(raw).hexdigest() != pin['sha256']):
+        raise ValueError('connector profile differs from PINNED')
+    return profile, pin
+
+
+def _managed_path():
+    override = os.environ.get('FISZU_CONNECT_MANAGED_SETTINGS')
+    if override:
+        return Path(override)
+    if sys.platform == 'darwin':
+        return Path('/Library/Application Support/ClaudeCode/managed-settings.json')
+    if os.name == 'nt':
+        return Path(r'C:\Program Files\ClaudeCode\managed-settings.json')
+    return Path('/etc/claude-code/managed-settings.json')
+
+
+def _ingest_headers():
+    path = _key_path()
+    try:
+        key = path.read_text().strip()
+    except OSError:
+        raise ValueError('machine ingest key missing; provision the ingest-key file') from None
+    if not key or any(c.isspace() for c in key):
+        raise ValueError('invalid machine ingest key')
+    return {'X-API-Key': key}
+
+
+def cmd_otel_headers(_args):
+    print(json.dumps(_ingest_headers()))
+    return 0
+
+
+INGEST_URL = 'https://claude.fiszu.com/api/v1/fleet/connector-ingest-key'
+INGEST_AUDIENCE = 'claude-usage-monitor'
+KEY_MISSING = 'machine ingest key missing/invalid'
+
+
+def _key_path():
+    return Path(os.environ.get('FISZU_CONNECT_INGEST_KEY_FILE', str(_dir() / 'ingest-key')))
+
+
+def _write_key(path, key):
+    """Atomically write the key at 0600 inside a 0700 directory; never echoed."""
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix='.ingest-key-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(key + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _enrol(send, access, host, path):
+    """POST the enrolment; (ok, message). The message never carries the key or a reply body."""
+    status, body = send('POST', INGEST_URL,
+                        {'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json',
+                         'Accept': 'application/json'}, json.dumps({'host': host}).encode())
+    if status != 200:
+        return False, 'ingest key enrolment refused (HTTP ' + str(status) + ')'
+    try:
+        data = json.loads(body)
+        key, machine = data['apiKey'], data['machineId']
+    except (ValueError, KeyError, TypeError):
+        return False, 'ingest key enrolment returned an unexpected reply'
+    if not isinstance(key, str) or not key or any(c.isspace() for c in key) or not isinstance(machine, str):
+        return False, 'ingest key enrolment returned an unexpected reply'
+    _write_key(path, key)
+    return True, 'ingest key enrolled (machineId ' + machine + ')'
+
+
+def cmd_enrol_ingest(args):
+    path = _key_path()
+    if path.exists() and not getattr(args, 'force', False):
+        try:
+            _ingest_headers()
+            print('fiszu-connect: ingest key already present (use --force to re-enrol)')
+            return 0
+        except ValueError:
+            pass
+    access = _token()
+    if INGEST_AUDIENCE not in _audiences(access):
+        raise LoginRequired('your sign-in lacks the ' + INGEST_AUDIENCE + ' audience — run: ' + LOGIN_HINT)
+    ok, message = _enrol(_http, access, socket.gethostname().split('.')[0], path)
+    print('fiszu-connect: ' + message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def _audiences(access):
+    aud = _claims(access).get('aud')
+    return aud if isinstance(aud, list) else [aud]
+
+
+def _expected_controls():
+    import copy
+    profile, pin = _profile()
+    expected = copy.deepcopy(profile)
+    version = expected.pop('profile_version')
+    helper = shlex.quote(str(Path(__file__).resolve()))
+    template = expected['otelHeadersHelper']
+    if template != '${FISZU_CONNECT} otel-headers':
+        raise ValueError('unsupported connector otelHeadersHelper template')
+    expected['otelHeadersHelper'] = template.replace('${FISZU_CONNECT}', helper)
+    return expected, pin, version
+
+
+def _merge_controls(current, expected):
+    if not isinstance(current, dict):
+        raise ValueError('managed settings must be an object')
+    result = dict(current)
+    for key, value in expected.items():
+        result[key] = _merge_controls(current.get(key, {}), value) if isinstance(value, dict) else value
+    return result
+
+
+def _drift(current, expected, prefix=''):
+    if not isinstance(current, dict):
+        return [prefix.rstrip('.')]
+    result = []
+    for key, value in expected.items():
+        name = prefix + key
+        if isinstance(value, dict):
+            result.extend(_drift(current.get(key), value, name + '.'))
+        elif current.get(key) != value:
+            result.append(name)
+    return result
+
+
+def _toml_merge(text, expected):
+    import re
+    import tomllib
+    current = tomllib.loads(text)
+    if not _drift(current, expected):
+        return text
+    # Preserve the original TOML, including unrelated tables and comments.
+    for section, values in [('', {k: v for k, v in expected.items() if not isinstance(v, dict)})] + [
+            (k, v) for k, v in expected.items() if isinstance(v, dict)]:
+        lines = text.splitlines(keepends=True)
+        starts = [i for i, line in enumerate(lines) if line.strip().startswith('[')]
+        start = 0 if not section else next((i + 1 for i in starts if lines[i].strip() == '[' + section + ']'), None)
+        if start is None:
+            lines.extend(['\n[' + section + ']\n'])
+            start = len(lines)
+        end = next((i for i in starts if i >= start), len(lines))
+        block = ''.join(lines[start:end])
+        for key, value in values.items():
+            assignment = key + ' = ' + json.dumps(value) + '\n'
+            pattern = r'(?m)^\s*' + re.escape(key) + r'\s*=.*(?:\n|$)'
+            if re.search(pattern, block):
+                block = re.sub(pattern, lambda _: assignment, block)
+            else:
+                block = assignment + block
+        text = ''.join(lines[:start]) + block + ''.join(lines[end:])
+    if _drift(tomllib.loads(text), expected):
+        raise ValueError('Codex requirements merge failed')
+    return text
+
+
+def _atomic_controls(path, text):
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, name = tempfile.mkstemp(prefix='.fiszu-controls-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _write_controls(path, expected, toml=False):
+    text = path.read_text() if path.exists() else ('' if toml else '{}')
+    if toml:
+        import tomllib
+        updated = _toml_merge(text, expected)
+        parse = tomllib.loads
+    else:
+        parse = json.loads
+        current = parse(text)
+        updated = text if not _drift(current, expected) else json.dumps(_merge_controls(current, expected), indent=2) + '\n'
+    if updated != text or not path.exists():
+        _atomic_controls(path, updated)
+    if _drift(parse(path.read_text()), expected):
+        raise ValueError('controls read-back verification failed')
+
+
+def _apply_file(path, expected, toml=False, override=False):
+    if override or (hasattr(os, 'geteuid') and os.geteuid() == 0):
+        _write_controls(path, expected, toml)
+        return
+    # Elevate only the merge/write, never the user's login or credential handling.
+    import inspect
+    source = 'import os,json\nfrom pathlib import Path\n'
+    for function in (_merge_controls, _drift, _toml_merge, _atomic_controls, _write_controls):
+        source += inspect.getsource(function) + '\n'
+    source += ('import sys\ntry:\n p=json.load(sys.stdin)\n'
+               ' _write_controls(Path(p["path"]),p["expected"],p["toml"])\n'
+               'except Exception:\n sys.exit("controls merge/read-back failed; existing settings retained where possible")\n')
+    result = subprocess.run(['sudo', sys.executable, '-c', source],
+                            input=json.dumps({'path': str(path), 'expected': expected, 'toml': toml}), text=True)
+    if result.returncode:
+        raise ValueError('privileged controls merge failed')
+
+
+def _codex_target():
+    return Path(os.environ.get('FISZU_CONNECT_CODEX_REQUIREMENTS', '/etc/codex/requirements.toml'))
+
+
+def cmd_apply_controls(_args):
+    expected, pin, version = _expected_controls()
+    if shutil.which('codex'):
+        import tomllib  # Codex TOML merging requires Python 3.11+.
+        _apply_file(_codex_target(), pin['codex_requirements'], toml=True,
+                    override='FISZU_CONNECT_CODEX_REQUIREMENTS' in os.environ)
+    _apply_file(_managed_path(), expected, override='FISZU_CONNECT_MANAGED_SETTINGS' in os.environ)
+    # Version is metadata, not an undocumented Claude managed-settings key.
+    kcd.save_private(_dir() / 'controls.json', {'profile_version': version, 'sha256': pin['sha256']})
+    # The controls are applied either way; a missing key alone is reported but not a failure.
+    return 1 if set(_controls_drift(print_status=True)) - {KEY_MISSING} else 0
+
+
+def _controls_drift(print_status=False):
+    expected, pin, version = _expected_controls()
+    current = json.loads(_managed_path().read_text()) if _managed_path().exists() else {}
+    drift = _drift(current, expected)
+    state = json.loads((_dir() / 'controls.json').read_text()) if (_dir() / 'controls.json').exists() else {}
+    if state != {'profile_version': version, 'sha256': pin['sha256']}:
+        drift.append('applied profile metadata')
+    try:
+        _ingest_headers()
+    except ValueError:
+        drift.append(KEY_MISSING)
+    if shutil.which('codex'):
+        import tomllib
+        target = _codex_target()
+        drift.extend('codex.' + key for key in _drift(tomllib.loads(target.read_text()) if target.exists() else {}, pin['codex_requirements']))
+    if print_status:
+        print('fiszu-connect: applied profile_version=' + str(state.get('profile_version', 'none')) +
+              ' expected=' + str(version) + (' drift: ' + ', '.join(drift) if drift else ' controls OK'))
+    return drift
+
+
+def cmd_controls_status(_args):
+    return 1 if _controls_drift(print_status=True) else 0
+
+
 def cmd_install(_args):
     """Standalone path (no CCP): register `fiszu` for this user, then sign in if needed."""
+    if cmd_apply_controls(_args):
+        return 1
     claude = shutil.which('claude')
     if not claude:
         print('fiszu-connect: `claude` is not on PATH — install Claude Code first', file=sys.stderr)
@@ -197,12 +469,26 @@ def cmd_install(_args):
     print('fiszu-connect: MCP server `' + SERVER_NAME + '` registered for this user')
     try:
         _token()
-        return cmd_status(_args)
+        code = cmd_status(_args)
     except LoginRequired:
-        return cmd_login(_args)
+        code = cmd_login(_args)
+    if code == 0:
+        _enrol_after_login(_args)
+    return code
 
 
-COMMANDS = {'headers': cmd_headers, 'login': cmd_login, 'status': cmd_status,
+def _enrol_after_login(args):
+    """Best effort: a failed enrolment is a warning and drift, never a blocked install."""
+    try:
+        cmd_enrol_ingest(args)
+    except (LoginRequired, OSError, ValueError, KeyError, TypeError) as exc:
+        reason = str(exc) if type(exc) in (ValueError, LoginRequired) else type(exc).__name__
+        print('fiszu-connect: warning: ingest key not enrolled (' + reason + '); '
+              'usage telemetry stays off until `fiszu-connect enrol-ingest` succeeds', file=sys.stderr)
+
+
+COMMANDS = {'apply-controls': cmd_apply_controls, 'controls-status': cmd_controls_status,
+            'otel-headers': cmd_otel_headers, 'enrol-ingest': cmd_enrol_ingest, 'headers': cmd_headers, 'login': cmd_login, 'status': cmd_status,
             'logout': cmd_logout, 'install': cmd_install}
 
 
@@ -213,7 +499,11 @@ def main(argv=None):
                'status — who you are signed in as\n'
                'headers — print the MCP auth headers (Claude Code runs this for you)\n'
                'logout — revoke and remove your sign-in\n'
-               'install — without CCP: register the `fiszu` MCP server and sign in\n'
+               'install — apply connector controls, register MCP and sign in\n'
+               'apply-controls — merge and verify the pinned control profile (sudo)\n'
+               'controls-status — report profile version and control drift\n'
+               'enrol-ingest — mint this machine\'s telemetry ingest key (needs sign-in)\n'
+               'otel-headers — emit the machine ingest header for Claude telemetry\n'
                'exit 3 = not signed in (the next `claude` launch signs you in)')
     parser.add_argument('command', choices=sorted(COMMANDS))
     parser.add_argument('--force', action='store_true',
@@ -224,7 +514,7 @@ def main(argv=None):
     except LoginRequired as exc:
         print('fiszu-connect: ' + str(exc), file=sys.stderr)
         return EXIT_LOGIN
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
         # A plain ValueError carries only this tool's own fixed messages; anything else may
         # quote a response, so it shows its class only.
         reason = str(exc) if type(exc) is ValueError else type(exc).__name__
