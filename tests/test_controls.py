@@ -56,12 +56,26 @@ class Controls(unittest.TestCase):
         self.target.write_text(json.dumps(actual))
         self.assertIn('DISABLE_EXTRA_USAGE_COMMAND', self.run_cli('controls-status', False).stdout)
 
-    def test_missing_key_fails_without_writing(self):
+    def test_missing_key_still_applies_controls(self):
         self.key.unlink()
-        self.run_cli('apply-controls', False)
-        self.assertFalse(self.target.exists())
+        result = self.run_cli('apply-controls')
+        self.assertIn('machine ingest key missing', result.stdout)
+        actual = json.loads(self.target.read_text())
+        self.assertEqual(actual['env']['DISABLE_EXTRA_USAGE_COMMAND'], '1')
+        self.assertIn('otelHeadersHelper', actual)
+        status = self.run_cli('controls-status', False)
+        self.assertIn('machine ingest key missing', status.stdout)
         result = self.run_cli('otel-headers', False)
-        self.assertNotIn('Authorization', result.stdout)
+        self.assertNotIn('X-API-Key', result.stdout)
+        self.assertEqual(result.stdout.strip(), '')
+
+    def test_missing_key_plus_other_drift_fails(self):
+        self.key.unlink()
+        self.run_cli('apply-controls')
+        actual = json.loads(self.target.read_text())
+        del actual['env']['DISABLE_EXTRA_USAGE_COMMAND']
+        self.target.write_text(json.dumps(actual))
+        self.assertIn('DISABLE_EXTRA_USAGE_COMMAND', self.run_cli('controls-status', False).stdout)
 
     def test_headers_use_only_machine_key(self):
         result = self.run_cli('otel-headers')
@@ -93,6 +107,64 @@ class Controls(unittest.TestCase):
         for forbidden in ('pangolin', 'lumen', 'setup.sh', 'repo-sync'):
             self.assertNotIn(forbidden, text)
         self.assertIn('apply-controls', text)
+
+
+class Enrol(unittest.TestCase):
+    SECRET = 'fixture-secret-api-key-0123456789'
+
+    def setUp(self):
+        import runpy
+        self.module = runpy.run_path(str(ROOT / 'fiszu-connect'))
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'config' / 'ingest-key'
+
+    def test_success_writes_private_key_and_returns_machine_id(self):
+        seen = {}
+
+        def send(method, url, headers, body):
+            seen.update(method=method, url=url, headers=headers, body=json.loads(body))
+            return 200, json.dumps({'apiKey': self.SECRET, 'machineId': 'm-42'}).encode()
+        ok, message = self.module['_enrol'](send, 'tok-abc', 'host1', self.path)
+        self.assertTrue(ok, message)
+        self.assertEqual(seen['method'], 'POST')
+        self.assertEqual(seen['url'], 'https://claude.fiszu.com/api/v1/fleet/connector-ingest-key')
+        self.assertEqual(seen['headers']['Authorization'], 'Bearer tok-abc')
+        self.assertEqual(seen['body'], {'host': 'host1'})
+        self.assertEqual(self.path.read_text().strip(), self.SECRET)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertIn('m-42', message)
+        self.assertNotIn(self.SECRET, message)
+
+    def test_401_leaves_no_file(self):
+        ok, message = self.module['_enrol'](lambda *a: (401, b'{"detail":"' + self.SECRET.encode() + b'"}'),
+                                            'tok', 'host1', self.path)
+        self.assertFalse(ok)
+        self.assertFalse(self.path.exists())
+        self.assertIn('401', message)
+        self.assertNotIn(self.SECRET, message)
+
+    def test_401_keeps_existing_key(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('old-key')
+        ok, _ = self.module['_enrol'](lambda *a: (401, b''), 'tok', 'host1', self.path)
+        self.assertFalse(ok)
+        self.assertEqual(self.path.read_text(), 'old-key')
+
+    def test_malformed_reply_leaves_no_file(self):
+        for body in (b'not json', b'{}', b'{"apiKey":"has space","machineId":"m"}'):
+            ok, _ = self.module['_enrol'](lambda *a: (200, body), 'tok', 'host1', self.path)
+            self.assertFalse(ok)
+            self.assertFalse(self.path.exists())
+
+    def test_cli_never_prints_key(self):
+        # No credentials in a scratch dir: the command must fail cleanly and print no key.
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, FISZU_CONNECT_CONFIG_DIR=directory)
+            result = subprocess.run([str(ROOT / 'fiszu-connect'), 'enrol-ingest'], env=env,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((Path(directory) / 'ingest-key').exists())
 
 
 class ProfileGate(unittest.TestCase):

@@ -1,11 +1,16 @@
 {
   "profile_version": 1,
+  "disableRemoteControl": true,
+  "autoUploadSessions": false,
+  "remoteControlAtStartup": false,
+  "autoContinueAtUsageLimit": false,
+  "otelHeadersHelper": "${FISZU_CONNECT} otel-headers",
   "env": {
+    "MAX_MCP_OUTPUT_TOKENS": "100000",
     "DISABLE_EXTRA_USAGE_COMMAND": "1",
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://claude.fiszu.com"
-  },
-  "otelHeadersHelper": "${FISZU_CONNECT} otel-headers"
+  }
 }

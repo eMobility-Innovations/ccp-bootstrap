@@ -1,8 +1,8 @@
 {
-  "ccp_commit": "008f13833a1394ee09d0146bd63c38c82a1555eb",
+  "ccp_commit": "24fff3a608853f6badf10a42a0dedcf89d2c1224",
   "profile_version": 1,
-  "source": "contract-v1 (CCP profile not yet published)",
-  "sha256": "f02685e34f981b181edfc94d32f1efcfd1da9b587ad696836cdb1984d4bc6c39",
+  "source": "policy/profiles/connector-managed-settings.json",
+  "sha256": "c8f1a9ef366f12718e2f7535b851fa397156bd641f235f0c2b50468ff3aa30ce",
   "codex_requirements": {
     "allow_remote_control": false,
     "allowed_approval_policies": [
